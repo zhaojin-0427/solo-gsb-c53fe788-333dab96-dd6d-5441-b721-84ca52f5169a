@@ -38,6 +38,7 @@ E_MIGRATION_SOURCE_INVALID = "MIGRATION_SOURCE_INVALID"
 E_MIGRATION_DIGEST_MISMATCH = "MIGRATION_DIGEST_MISMATCH"
 E_MIGRATION_CONFLICT = "MIGRATION_CONFLICT"
 E_MIGRATION_COMPLETED = "MIGRATION_COMPLETED"
+E_MIGRATION_FAILED = "MIGRATION_FAILED"
 
 _STATUS = {
     E_BAD_REQUEST: 400,
@@ -68,6 +69,7 @@ _STATUS = {
     E_MIGRATION_DIGEST_MISMATCH: 409,
     E_MIGRATION_CONFLICT: 409,
     E_MIGRATION_COMPLETED: 409,
+    E_MIGRATION_FAILED: 409,
 }
 
 _MESSAGES = {
@@ -99,6 +101,7 @@ _MESSAGES = {
     E_MIGRATION_DIGEST_MISMATCH: "bound source/target policy version digest no longer matches the immutable record",
     E_MIGRATION_CONFLICT: "a different open migration already exists for this custody, or the same custody is already migrated",
     E_MIGRATION_COMPLETED: "migration session is already completed",
+    E_MIGRATION_FAILED: "migration session has terminally failed (pending shares lost); start a new migration with a fresh idempotency key",
 }
 
 

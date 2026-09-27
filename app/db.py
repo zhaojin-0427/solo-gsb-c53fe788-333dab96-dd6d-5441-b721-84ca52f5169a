@@ -131,7 +131,7 @@ CREATE TABLE IF NOT EXISTS migration_sessions (
     target_version      INTEGER NOT NULL,
     target_digest       TEXT NOT NULL,          -- 创建时固化的目标策略版本摘要
     idempotency_key_hash TEXT NOT NULL,         -- 只存幂等键摘要
-    status              TEXT NOT NULL DEFAULT 'open',  -- open | completed | expired
+    status              TEXT NOT NULL DEFAULT 'open',  -- open | completed | expired | failed
     new_custody_id      TEXT REFERENCES key_custodies(id),
     valid_until         TIMESTAMPTZ NOT NULL,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -139,7 +139,7 @@ CREATE TABLE IF NOT EXISTS migration_sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_migration_tenant ON migration_sessions(tenant_id);
 -- 幂等：同租户同一幂等键的“有效(open)”会话唯一；completed 行保留以便幂等重放，
--- expired 行不占位（TTL 失效后允许用同一键安全重试）。
+-- expired/failed 行不占位（TTL 失效或缺片终态化后允许用新键安全重试）。
 CREATE UNIQUE INDEX IF NOT EXISTS uq_migration_idem_open
     ON migration_sessions(tenant_id, idempotency_key_hash)
     WHERE status = 'open';

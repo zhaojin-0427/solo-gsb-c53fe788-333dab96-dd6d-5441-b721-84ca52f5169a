@@ -32,6 +32,24 @@ v1.4 新增**跨策略密钥迁移**：租户对仍有效的托管记录指定�
 > （行锁释放前先凭 token 撤回内存分片再回滚）。端到端与存储层断言见 `scripts/demo.py`
 > （108 项，迁移用例覆盖正常流程、每类拒绝依据、并发重复、TTL 安全重试与存储层无明文）。
 
+> **修复要点（v1.5）**：修复跨策略迁移在**待累计分片丢失**后的永久卡死。场景：首名托管人
+> 已提交分片（数据库已计数），API 进程重启或内存池淘汰使该分片丢失；另一名托管人提交使
+> 数据库计数达到源门限时，`/migrations/shares` 返回 `THRESHOLD_NOT_MET` 却**仅回滚本次
+> 提交**——旧提交行与 `UNIQUE(migration_id, custodian_id)` 仍在，原托管人 nonce 已花费
+> 无法补交；open 会话同时占住两条部分唯一索引，新幂等键在 TTL 到期前只能得到
+> `MIGRATION_CONFLICT`，迁移被卡死到会话过期。现改为：识别出缺片（数据库计数将达门限、
+> 内存分片不足）时，在**会话行锁仍持有、事务仍打开**时协调——① 凭本次 token 撤回本次
+> 内存分片；② 同事务撤销本次数据库写入（提交行删除、nonce 恢复未花费），本次提交如同
+> 从未发生，旧提交作为历史保留；③ 会话置 **`failed` 终态**并写无明文审计
+> （`migration.failed`），随本事务**提交**而非回滚——open 占位（两条部分唯一索引）随之
+> 释放；④ 锁队列中等待的旧会话请求拿锁后只见 failed 终态，一律 `MIGRATION_FAILED`，
+> 绝不可能再完成迁移。此后租户用**新幂等键**即可从源记录重新发起（源记录全程 active，
+> 无需等 TTL）；同键重放返回 failed 会话（200），同键异体仍 `IDEMPOTENCY_CONFLICT`；
+> 重建的迁移完成时全局仍只产生一个新托管记录（failed 会话 `new_custody_id` 恒为 NULL，
+> 部分唯一索引兜底）。回归验证见 `scripts/race_migration.py`（25 项断言，M1–M5），
+> 覆盖**进程重启**（整体替换内存池）与**内存池淘汰**（clear）两条缺片路径、行锁等待者
+> 交错、失败后可查询终态与重建后不重复迁移。
+
 > **修复要点（v1.3）**：修复 `/recoveries/shares` 在“分片**已入内存池之后**异常回滚”时的交错竞态
 > （重组失败、审计写入失败、连接中止等）。旧代码在异常路径上**先 `ROLLBACK` 释放会话行锁、
 > 再移除本次内存分片**：① 同会话正在锁队列里等待的请求可能在这一瞬间读到未提交分片；
@@ -98,15 +116,18 @@ docker compose exec api python -m app.seed
 
 ## 2. 快速体验（端到端）
 
-容器自带完整验收脚本，覆盖正常恢复、每一种拒绝依据、并发竞态、跨策略迁移与审计链重放：
+容器自带完整验收脚本，覆盖正常恢复、每一种拒绝依据、并发竞态、跨策略迁移、
+迁移缺片终态化与审计链重放：
 
 ```bash
 # 1) 并发回滚竞态回归（scripts.race_recovery，38 项）
-# 2) 端到端验收（scripts.demo，108 项）
+# 2) 迁移缺片终态化回归（scripts.race_migration，25 项）
+# 3) 端到端验收（scripts.demo，108 项）
 docker compose --profile demo run --rm demo
 ```
 
-期望依次输出 `RACE REGRESSION CHECKS PASSED` 与 `ALL CHECKS PASSED`。
+期望依次输出 `RACE REGRESSION CHECKS PASSED`、`MIGRATION RESTART REGRESSION CHECKS PASSED`
+与 `ALL CHECKS PASSED`。
 
 `scripts.race_recovery.py` 在进程内以真实 ASGI + 真实 PostgreSQL 行锁运行，通过仅测试构建启用的
 故障注入闸门（`KEYVAULT_FAULT_INJECTION=1`，API 服务默认关闭、关闭时零开销）精确钉住交错点：
@@ -118,6 +139,19 @@ docker compose --profile demo run --rm demo
 KEYVAULT_FAULT_INJECTION=1 \
 KEYVAULT_DATABASE_URL=postgresql://keyvault:keyvault@localhost:5432/keyvault \
 python -m scripts.race_recovery
+```
+
+`scripts.race_migration.py` 同样以进程内真实 ASGI + 真实 PostgreSQL 行锁运行，复现并钉住
+v1.5 修复的迁移卡死：首名托管人分片已计数后**模拟进程重启**（整体替换内存池）或**内存池淘汰**
+（clear），第二名托管人的提交使数据库计数达到源门限；断言本次提交被整体撤销（内存 token、
+提交行、nonce 花费）、会话被**提交**为可查询的 `failed` 终态并释放 open 占位、锁队列中的
+等待者与后续一切旧会话请求只得 `MIGRATION_FAILED`、新幂等键可立即重建且全局只产生一个新
+托管记录、同键重放返回 failed 会话、审计链完整且无明文。本地单独运行：
+
+```bash
+KEYVAULT_FAULT_INJECTION=1 \
+KEYVAULT_DATABASE_URL=postgresql://keyvault:keyvault@localhost:5432/keyvault \
+python -m scripts.race_migration
 ```
 
 以下用 curl 走一遍核心流程（演示凭据见 `python -m app.seed` 输出）：
@@ -216,7 +250,9 @@ curl -s -X POST localhost:8000/recoveries/shares \
 > 待累计分片**只存进程内存**（`app/pending.py`），不写库、不写日志、不进审计；进程重启后内存清空，
 > 已计数的会话无法继续重组，需另开恢复会话（提交接口此时返回 `THRESHOLD_NOT_MET`，basis.reason 为
 > `pending_shares_unavailable`）。这是本演示基线在“明文不落盘”与“多副本部署”之间的明确取舍。
-> 迁移会话的待累计源分片复用同一内存池（以 migration_id 为键），语义完全相同。
+> 迁移会话的待累计源分片复用同一内存池（以 migration_id 为键）；但迁移会话受幂等键与唯一索引
+> 约束不能随意另开，因此缺片时不再让会话卡死，而是按 v1.5 协调为 `failed` 终态并释放 open
+> 占位（见 2.9 的失败重试语义）。
 
 ### 2.9 跨策略密钥迁移（curl 流程）
 
@@ -262,7 +298,7 @@ curl -s -X POST localhost:8000/migrations/shares -H "X-API-Key: $CUSTODIAN_KEY" 
 
 # 查询迁移会话（幂等/排障）
 curl -s localhost:8000/migrations/mig_... -H "X-API-Key: $TENANT"
-# -> status(open|completed|expired)、shares_received、threshold、new_custody_id
+# -> status(open|completed|expired|failed)、shares_received、threshold、new_custody_id
 ```
 
 **迁移的拒绝与重试语义**：
@@ -284,6 +320,19 @@ curl -s localhost:8000/migrations/mig_... -H "X-API-Key: $TENANT"
   若不可变版本行与固化摘要不符 → `MIGRATION_DIGEST_MISMATCH`（完整性兜底）。
 - 会话超过 TTL、或源侧在途失效后，旧 open 会话在该 custody 下一次请求时被惰性置 `expired`，
   随后可用同一幂等键（也可用新键）安全重试；确定性 4xx 不花费 nonce，可直接用原 nonce 重领重试。
+- **缺片失败与重试（v1.5）**：进程重启或内存池淘汰丢失待累计分片后，使数据库计数达到源门限的
+  那次提交返回 `THRESHOLD_NOT_MET`（basis.reason=`pending_shares_unavailable`），同时会话被
+  **提交为 `failed` 终态**（`GET /migrations/{id}` 可查询，`migration.failed` 已入审计链）：
+  - 本次提交被整体撤销——提交行删除、nonce 恢复未花费、内存分片凭 token 撤回，旧提交作为
+    历史保留（`shares_received` 保持原计数）；
+  - open 占位（两条部分唯一索引）已释放：**换新幂等键** `POST /migrations` 即可从源记录立即
+    重新发起（源记录全程 active，无需等 TTL），原托管人在新会话重新走 nonce → claim →
+    sign → submit 即可补足门限；
+  - 旧会话上的一切后续请求（nonce/claim/submit，含当时正在锁队列中等待的请求）一律
+    `MIGRATION_FAILED`，绝不可能再完成迁移；
+  - 同一幂等键重放返回 failed 会话（200，幂等语义），同键异体仍 `IDEMPOTENCY_CONFLICT`；
+  - failed 会话 `new_custody_id` 恒为 NULL，重建的迁移完成时全局只产生一个新托管记录，
+    此后再发起一律 `MIGRATION_CONFLICT`（`custody_already_migrated`）。
 - 并发创建由源 custody 行锁串行化 + 部分唯一索引兜底：同键并发恰有一次 201、另一次重放 200；
   不同键并发恰有一次 201、另一次 `MIGRATION_CONFLICT`。
 
@@ -355,13 +404,14 @@ curl -s localhost:8000/audit/replay -H "X-API-Key: $TENANT"
 | `DUPLICATE_SHARE` | 同一托管人对同一会话重复提交 |
 | `CROSS_POLICY_SHARE` | 托管人不属于该策略版本，或 nonce/领取/提交绑定的会话、托管人不匹配 |
 | `SESSION_COMPLETED` / `SESSION_EXPIRED` | 会话已完成（密文只下发一次）/ 已过 TTL |
-| `THRESHOLD_NOT_MET` / `INTEGRITY_CHECK_FAILED` | 有效分片不足（含重启后内存待累计分片丢失 `pending_shares_unavailable`）/ 重组结果摘要不匹配 |
+| `THRESHOLD_NOT_MET` / `INTEGRITY_CHECK_FAILED` | 有效分片不足（含重启后内存待累计分片丢失 `pending_shares_unavailable`；迁移场景下会话同时被提交为 `failed` 终态）/ 重组结果摘要不匹配 |
 | `IDEMPOTENCY_CONFLICT` | `Idempotency-Key` 已绑定另一个不同的迁移请求，或同键并发正在创建 |
 | `MIGRATION_TARGET_INVALID` | 目标策略版本不存在、已撤销/已过期、属于其他租户，或与源版本相同 |
 | `MIGRATION_SOURCE_INVALID` | 源托管记录非 active（已轮换/撤销）或源策略版本已撤销/过期，不能发起迁移 |
 | `MIGRATION_DIGEST_MISMATCH` | 会话绑定的源/目标策略版本摘要与不可变版本行不符（完整性兜底） |
 | `MIGRATION_CONFLICT` | 同一 custody 存在其他 open 迁移会话，或该 custody 已迁移完成（不同幂等键不得重复迁移） |
 | `MIGRATION_COMPLETED` | 迁移会话已完成（新托管记录只生成一次） |
+| `MIGRATION_FAILED` | 迁移会话已因缺片终态化（failed）：不可再提交/领取，须用新幂等键重新发起 |
 
 ---
 
@@ -439,12 +489,22 @@ AAD 绑定会话全部要素，密文无法被挪到别的会话复用。待累�
 以释放唯一索引，之后同键/新键均可安全重试。幂等重放（含完成态）返回 200 与同一新 custody 标识，
 迁移全过程的响应、数据库与审计只出现 ID、版本摘要、点位和分片/秘密摘要，不出现任何明文。
 
+**缺片终态化（v1.5）**：待累计源分片只存进程内存，进程重启或内存池淘汰后，已计数的旧提交
+无法参与重组。达到源门限的那次提交一旦发现内存分片不足（绝不回退到解密库存分片凑数），
+就在**会话行锁仍持有、事务仍打开**时完成协调：凭本次 token 撤回本次内存分片 → 同事务撤销
+本次数据库写入（提交行删除、nonce 恢复未花费）→ 会话置 `failed` 终态并写 `migration.failed`
+审计 → **提交**事务（而非回滚）。由于行锁全程持有，锁队列中等待的同会话请求拿锁时只见
+failed 终态（`MIGRATION_FAILED`），不可能读到中间态、更不可能再完成迁移；两条部分唯一索引
+不再覆盖 failed 行，open 占位即时释放，新幂等键可立即从源记录重新发起，而
+`UNIQUE(source_custody_id) WHERE new_custody_id IS NOT NULL` 依旧保证全局不会重复迁移。
+回归验证见 `scripts/race_migration.py`（25 项断言）。
+
 **审计：按序、可重放、不泄密**
 `audit_log` 仅追加，每条记录 `seq`（事务级 advisory lock 串行分配）与
 `entry_hash = SHA256(规范字段 || prev_hash)`，形成哈希链；`GET /audit/replay`
 逐条复算并报告首个断裂点。审计内容只含 ID、版本、epoch、**分片点位与摘要**、计数等事实，
 写入口还会按字段名（secret/private/ciphertext/plaintext/share_blob/nonce/key…）二次过滤，
-拒绝事件同样留痕（含 `migration.start/nonce.issue/shard.claim/share.submit/complete`
+拒绝事件同样留痕（含 `migration.start/nonce.issue/shard.claim/share.submit/complete/failed`
 及其 denied 记录）。
 
 ---
@@ -458,7 +518,8 @@ pip install -r requirements.txt
 python -m app.seed                      # 建表 + 演示身份
 uvicorn app.main:app --reload --port 8000
 KEYVAULT_BASE_URL=http://localhost:8000 python -m scripts.demo       # 端到端验收（含跨策略迁移，108 项）
-KEYVAULT_FAULT_INJECTION=1 python -m scripts.race_recovery           # 并发回滚竞态回归
+KEYVAULT_FAULT_INJECTION=1 python -m scripts.race_recovery           # 并发回滚竞态回归（38 项）
+KEYVAULT_FAULT_INJECTION=1 python -m scripts.race_migration          # 迁移缺片终态化回归（25 项）
 ```
 
 ## 6. 生产注意（本仓库为演示强化基线，上线前至少完成）

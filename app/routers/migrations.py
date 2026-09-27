@@ -18,6 +18,21 @@ the existing claim channel, never in the database (only digests) and never in
 audit rows. Revoked/expired versions, cross-tenant references, concurrent and
 repeated migrations are rejected; distinct idempotency keys can never migrate
 the same custody twice; deterministic failures are safe retries.
+
+Terminal ``failed`` state (v1.5): if the in-memory pending shares are lost
+(process restart / pool eviction) after earlier submissions were counted, the
+threshold-reaching submit cannot reconstruct. Rolling back only that
+submission would strand the session ``open`` until TTL — the earlier
+custodian's nonce is spent (no resubmit possible) and the open placeholder
+blocks any fresh idempotency key with ``MIGRATION_CONFLICT``. Instead, while
+still holding the session row lock, the submitter retracts its own in-memory
+share, undoes its own writes (submission row + nonce spend) inside the same
+transaction, and **commits** the session to the queryable terminal state
+``failed`` with a plaintext-free audit record. The open placeholder (both
+partial unique indexes) is thereby released: queued requests on the old
+session are rejected with ``MIGRATION_FAILED`` and can never complete it,
+while the tenant can immediately re-initiate from the source record with a
+fresh idempotency key — still never producing a duplicate new custody.
 """
 from __future__ import annotations
 
@@ -39,6 +54,7 @@ from ..errors import (
     E_MIGRATION_COMPLETED,
     E_MIGRATION_CONFLICT,
     E_MIGRATION_DIGEST_MISMATCH,
+    E_MIGRATION_FAILED,
     E_MIGRATION_SOURCE_INVALID,
     E_MIGRATION_TARGET_INVALID,
     E_NONCE_USED,
@@ -151,6 +167,11 @@ async def _guard_migration(conn, mig, source_policy, target_policy, now,
     """Gates shared by nonce issue / shard claim / share submit."""
     if mig["status"] == "completed":
         raise ApiError(E_MIGRATION_COMPLETED, basis={"migration_id": mig["id"]})
+    if mig["status"] == "failed":
+        # 缺片终态（v1.5）：内存待累计分片丢失后，会话已被提交为 failed 并
+        # 释放 open 占位。任何在途/重试请求（含锁队列里的等待者）一律拒绝，
+        # 绝不可能再完成迁移；租户须用新幂等键从源记录重新发起。
+        raise ApiError(E_MIGRATION_FAILED, basis={"migration_id": mig["id"]})
     if mig["status"] == "expired" or now >= mig["valid_until"]:
         raise ApiError(E_SESSION_EXPIRED,
                        basis={"valid_until": str(mig["valid_until"]), "now": str(now)})
@@ -701,6 +722,8 @@ async def submit_share(body: MigrationShareSubmitIn, request: Request,
     pending = request.app.state.pending
     sess_tenant: str | None = None
     pending_token = None
+    sub_id: str | None = None
+    nonce_id: str | None = None
     completed = False
     count = 0
     threshold = 0
@@ -739,6 +762,7 @@ async def submit_share(body: MigrationShareSubmitIn, request: Request,
             await _guard_migration(conn, mig, source_policy, target_policy, now, custodian["id"])
 
             nonce_row = await _resolve_nonce(conn, body.migration_id, body.nonce, custodian["id"])
+            nonce_id = nonce_row["id"]
             if nonce_row["spent"]:
                 raise ApiError(E_NONCE_USED, basis={"nonce_id": nonce_row["id"]})
 
@@ -799,7 +823,7 @@ async def submit_share(body: MigrationShareSubmitIn, request: Request,
                 )
 
             await conn.execute(
-                "UPDATE migration_nonces SET spent=TRUE WHERE id=$1", nonce_row["id"]
+                "UPDATE migration_nonces SET spent=TRUE WHERE id=$1", nonce_id
             )
             sub_id = deps.new_id("msub")
             try:
@@ -847,6 +871,54 @@ async def submit_share(body: MigrationShareSubmitIn, request: Request,
                 await _undo()
                 raise
         except ApiError as exc:
+            if (
+                exc.code == E_THRESHOLD_NOT_MET
+                and exc.basis.get("reason") == "pending_shares_unavailable"
+                and pending_token is not None
+            ):
+                # 缺片终态化协调（v1.5）：进程重启/内存池淘汰后，已计数分片
+                # 在内存不可得，会话永远凑不齐门限。旧实现仅回滚本次提交——
+                # 旧提交行与 UNIQUE(migration_id, custodian_id) 仍在，原托管人
+                # nonce 已花费无法补交；open 会话同时占住两条部分唯一索引，
+                # 新幂等键在 TTL 到期前只能得到 MIGRATION_CONFLICT，迁移被
+                # 永久卡死。现在在**会话行锁仍持有、事务仍打开**时协调：
+                #   1) 凭本次 token 精确撤回本次内存分片；
+                #   2) 同事务撤销本次数据库写入（提交行删除、nonce 恢复未花费）
+                #      ——本次提交如同从未发生，旧提交作为历史保留；
+                #   3) 会话置 failed 终态并写无明文审计，随本事务**提交**而非
+                #      回滚——open 占位（两条部分唯一索引）随之释放；
+                #   4) 锁队列中的等待者拿锁后只见 failed 终态（MIGRATION_FAILED），
+                #      绝不可能再完成迁移；租户可立即用新幂等键从源记录重新发起。
+                pending.discard(pending_token)
+                pending_token = None
+                await conn.execute(
+                    "DELETE FROM migration_share_submissions WHERE id=$1", sub_id
+                )
+                await conn.execute(
+                    "UPDATE migration_nonces SET spent=FALSE WHERE id=$1", nonce_id
+                )
+                await conn.execute(
+                    "UPDATE migration_sessions SET status='failed' WHERE id=$1",
+                    body.migration_id,
+                )
+                await audit.append_audit(
+                    conn, tenant_id=sess_tenant, actor_type="system", actor_id=None,
+                    action="migration.failed", resource=body.migration_id, result="ok",
+                    basis={
+                        "reason": "pending_shares_unavailable",
+                        "committed_shares": count - 1,
+                        "pending_in_memory": pending.count(body.migration_id),
+                        "threshold": threshold,
+                    },
+                )
+                await tx.commit()
+                # 本次提交的拒绝同样留痕（独立事务），与确定性拒绝一致。
+                await repo.audit_denied(
+                    pool, tenant_id=sess_tenant, actor_type="custodian",
+                    actor_id=custodian["id"], action="migration.share.submit",
+                    resource=body.migration_id, error_code=exc.code, basis=exc.basis,
+                )
+                raise
             await _undo()
             await repo.audit_denied(
                 pool, tenant_id=sess_tenant, actor_type="custodian", actor_id=custodian["id"],
@@ -883,7 +955,10 @@ async def _resplit(conn, pending, mig, source_policy, target_policy):
     settings = get_settings()
     points = sorted(pending.get_points(mig["id"]), key=lambda p: p[0])
     if len(points) < source_policy["threshold"]:
-        # 进程重启等导致内存待累计分片丢失：绝不回退到解密库存分片。
+        # 进程重启/内存池淘汰导致内存待累计分片丢失：绝不回退到解密库存分片。
+        # 该异常由 submit_share 的缺片协调分支接管（行锁仍持有时撤回本次
+        # 分片、同事务撤销本次写入、会话提交为 failed 终态），而不是仅回滚
+        # 本次提交让会话卡死在 open。
         raise ApiError(
             E_THRESHOLD_NOT_MET,
             basis={"reason": "pending_shares_unavailable",
