@@ -119,7 +119,8 @@ ALTER TABLE share_submissions ADD COLUMN IF NOT EXISTS shard_digest TEXT;
 
 -- 跨策略密钥迁移会话：租户以幂等键创建，绑定源 custody 与源/目标“策略版本摘要”。
 -- 源门限达成后秘密仅在内存重组、立即按目标策略重新分片，新托管记录同事务写入；
--- 源记录保持 active 不变。
+-- 源记录保持 active 不变。已计数分片的内存明文丢失（重启/淘汰）时，检出缺片的
+-- 提交在同一事务里把会话置 failed 终态，释放 open 占位供重新发起。
 CREATE TABLE IF NOT EXISTS migration_sessions (
     id                  TEXT PRIMARY KEY,
     tenant_id           TEXT NOT NULL REFERENCES tenants(id),
@@ -131,7 +132,7 @@ CREATE TABLE IF NOT EXISTS migration_sessions (
     target_version      INTEGER NOT NULL,
     target_digest       TEXT NOT NULL,          -- 创建时固化的目标策略版本摘要
     idempotency_key_hash TEXT NOT NULL,         -- 只存幂等键摘要
-    status              TEXT NOT NULL DEFAULT 'open',  -- open | completed | expired
+    status              TEXT NOT NULL DEFAULT 'open',  -- open | completed | expired | failed
     new_custody_id      TEXT REFERENCES key_custodies(id),
     valid_until         TIMESTAMPTZ NOT NULL,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -139,11 +140,11 @@ CREATE TABLE IF NOT EXISTS migration_sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_migration_tenant ON migration_sessions(tenant_id);
 -- 幂等：同租户同一幂等键的“有效(open)”会话唯一；completed 行保留以便幂等重放，
--- expired 行不占位（TTL 失效后允许用同一键安全重试）。
+-- expired/failed 行不占位（终态后允许用同一键或新键安全重试）。
 CREATE UNIQUE INDEX IF NOT EXISTS uq_migration_idem_open
     ON migration_sessions(tenant_id, idempotency_key_hash)
     WHERE status = 'open';
--- 并发/重复迁移拦截：同一源托管记录至多一个 open 会话；
+-- 并发/重复迁移拦截：同一源托管记录至多一个 open 会话（failed 终态立即释放占位）；
 -- 已完成迁移（new_custody_id 非空）全局唯一——不同幂等键也不得重复迁移。
 CREATE UNIQUE INDEX IF NOT EXISTS uq_migration_source_open
     ON migration_sessions(source_custody_id) WHERE status = 'open';

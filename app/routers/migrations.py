@@ -12,6 +12,16 @@ Flow (mirrors the recovery protocol, minus the one-time wrap):
    **in request memory only** from verified submitted shards, immediately
    re-shards under the target policy, and writes the new custody + encrypted
    shard rows in the **same transaction**; the source record is never touched.
+4. If the in-memory pending shards were lost meanwhile (process restart or
+   pool eviction) the session can never reach the threshold again — committed
+   submissions cannot be re-sent (unique constraint + spent nonces). The
+   submission that first detects the gap therefore, **while still holding the
+   session row lock**, retracts its own in-memory/DB share, marks the session
+   ``failed`` (a queryable terminal state that frees the open-place unique
+   indexes) and appends a plaintext-free audit entry — all in one transaction.
+   Waiting submitters then fail fast with ``MIGRATION_FAILED`` instead of
+   completing, and the tenant can immediately re-start the migration from the
+   source record with a fresh (or the same) idempotency key.
 
 Plaintext (secret / submitted shard / nonce) never appears in responses beyond
 the existing claim channel, never in the database (only digests) and never in
@@ -39,6 +49,7 @@ from ..errors import (
     E_MIGRATION_COMPLETED,
     E_MIGRATION_CONFLICT,
     E_MIGRATION_DIGEST_MISMATCH,
+    E_MIGRATION_FAILED,
     E_MIGRATION_SOURCE_INVALID,
     E_MIGRATION_TARGET_INVALID,
     E_NONCE_USED,
@@ -151,6 +162,14 @@ async def _guard_migration(conn, mig, source_policy, target_policy, now,
     """Gates shared by nonce issue / shard claim / share submit."""
     if mig["status"] == "completed":
         raise ApiError(E_MIGRATION_COMPLETED, basis={"migration_id": mig["id"]})
+    if mig["status"] == "failed":
+        # 缺片终态：已计数分片的内存明文曾丢失，会话永远无法再凑齐门限。
+        # 任何在途/后续请求一律确定性拒绝，调用方用新会话重来。
+        raise ApiError(
+            E_MIGRATION_FAILED,
+            basis={"migration_id": mig["id"], "reason": "migration_session_failed",
+                   "source_custody_id": mig["source_custody_id"]},
+        )
     if mig["status"] == "expired" or now >= mig["valid_until"]:
         raise ApiError(E_SESSION_EXPIRED,
                        basis={"valid_until": str(mig["valid_until"]), "now": str(now)})
@@ -230,6 +249,8 @@ async def start_migration(
                 # 版本被撤销/过期）的 open 会话在同源新事务（本事务随后提交）中
                 # 置 expired，释放两条部分唯一索引——失败后可用同键或新键安全重试，
                 # 且不会被一个“永远无法再完成”的 open 会话无限占位。
+                # （因内存待累计分片丢失而永远无法凑齐门限的会话，则在提交侧
+                # 检出缺片的同一事务里直接置 failed 终态，见 submit_share。）
                 await conn.execute(
                     """
                     UPDATE migration_sessions m SET status='expired'
@@ -250,10 +271,12 @@ async def start_migration(
                 now = await conn.fetchval("SELECT now()")
 
                 # 幂等重放优先：同键的已有会话（open/completed）原样返回；
-                # expired 行不占位（唯一索引不含 expired），允许安全重试。
+                # expired/failed 行不占位（唯一索引不含二者），终态失败后
+                # 允许用同一幂等键（或新键）从源记录安全重新发起。
                 existing = await conn.fetchrow(
                     "SELECT * FROM migration_sessions "
-                    "WHERE tenant_id=$1 AND idempotency_key_hash=$2 AND status <> 'expired' "
+                    "WHERE tenant_id=$1 AND idempotency_key_hash=$2 "
+                    "AND status NOT IN ('expired','failed') "
                     "ORDER BY created_at DESC LIMIT 1",
                     tenant["id"], idem_hash,
                 )
@@ -707,6 +730,7 @@ async def submit_share(body: MigrationShareSubmitIn, request: Request,
     new_custody_id: str | None = None
     new_shard_count: int | None = None
     new_shard_digests: list[str] | None = None
+    gap_error: ApiError | None = None
 
     async with pool.acquire() as conn:
         tx = conn.transaction()
@@ -831,16 +855,72 @@ async def submit_share(body: MigrationShareSubmitIn, request: Request,
 
             if count >= threshold:
                 await faults.maybe_park(request, "migration.before_resplit")
-                completed, new_custody_id, new_shard_count, new_shard_digests = (
-                    await _resplit(conn, pending, mig, source_policy, target_policy)
-                )
+                try:
+                    completed, new_custody_id, new_shard_count, new_shard_digests = (
+                        await _resplit(conn, pending, mig, source_policy, target_policy)
+                    )
+                except ApiError as exc:
+                    if not (
+                        exc.code == E_THRESHOLD_NOT_MET
+                        and exc.basis.get("reason") == "pending_shares_unavailable"
+                    ):
+                        raise
+                    # ---- 缺片不可恢复：数据库计数已达源门限，但部分已提交分片
+                    # 的内存明文丢失（进程重启/内存池淘汰）。已计数的托管人受
+                    # 唯一约束与已花费 nonce 限制永远无法补交，会话不可能再
+                    # 凑齐门限——不能让它以 open 状态占位到 TTL。
+                    # 行锁仍持有，在同一事务内依次完成：
+                    #   ① 凭本次 token 撤回内存分片（v1.3 撤销边界不变）；
+                    #   ② 撤销本次库写入（提交记录删除、nonce 恢复未花费）；
+                    #   ③ 会话置 failed 终态——释放 open 占位（两条部分唯一
+                    #      索引均不含 failed），等待者拿锁即得 MIGRATION_FAILED；
+                    #   ④ 追加无明文 migration.fail 审计。
+                    # 随后整体提交；提交成功才清理内存池并返回确定性错误。
+                    if pending_token is not None:
+                        pending.discard(pending_token)
+                        pending_token = None
+                    await conn.execute(
+                        "UPDATE migration_nonces SET spent=FALSE WHERE id=$1", nonce_row["id"]
+                    )
+                    await conn.execute(
+                        "DELETE FROM migration_share_submissions WHERE id=$1", sub_id
+                    )
+                    await conn.execute(
+                        "UPDATE migration_sessions SET status='failed' "
+                        "WHERE id=$1 AND status='open'",
+                        mig["id"],
+                    )
+                    committed = await conn.fetchval(
+                        "SELECT count(*) FROM migration_share_submissions "
+                        "WHERE migration_id=$1",
+                        mig["id"],
+                    )
+                    exc.basis["migration_id"] = mig["id"]
+                    exc.basis["migration_status"] = "failed"
+                    await audit.append_audit(
+                        conn, tenant_id=sess_tenant, actor_type="system", actor_id=None,
+                        action="migration.fail", resource=mig["id"], result="error",
+                        error_code=E_THRESHOLD_NOT_MET,
+                        basis={
+                            "reason": "pending_shares_unavailable",
+                            "shares_committed": committed,
+                            "threshold": threshold,
+                            "source_custody_id": mig["source_custody_id"],
+                            "source_policy_id": mig["source_policy_id"],
+                            "source_version": mig["source_version"],
+                            "target_policy_id": mig["target_policy_id"],
+                            "target_version": mig["target_version"],
+                        },
+                    )
+                    gap_error = exc
 
-            await audit.append_audit(
-                conn, tenant_id=sess_tenant, actor_type="custodian", actor_id=custodian["id"],
-                action="migration.share.submit", resource=body.migration_id, result="ok",
-                basis={"shares_after": count, "threshold": threshold, "completed": completed,
-                       "point_x": body.point_x, "shard_digest": shard["shard_digest"]},
-            )
+            if gap_error is None:
+                await audit.append_audit(
+                    conn, tenant_id=sess_tenant, actor_type="custodian", actor_id=custodian["id"],
+                    action="migration.share.submit", resource=body.migration_id, result="ok",
+                    basis={"shares_after": count, "threshold": threshold, "completed": completed,
+                           "point_x": body.point_x, "shard_digest": shard["shard_digest"]},
+                )
             try:
                 await tx.commit()
             except Exception:
@@ -858,6 +938,16 @@ async def submit_share(body: MigrationShareSubmitIn, request: Request,
             await _undo()
             raise
 
+    if gap_error is not None:
+        # failed 终态已提交：会话再不可能完成，销毁其全部残留内存分片；
+        # 本次提交已被撤销，补一条确定性拒绝留痕后向调用方返回错误。
+        pending.clear(body.migration_id)
+        await repo.audit_denied(
+            pool, tenant_id=sess_tenant, actor_type="custodian", actor_id=custodian["id"],
+            action="migration.share.submit", resource=body.migration_id,
+            error_code=gap_error.code, basis=gap_error.basis,
+        )
+        raise gap_error
     if completed:
         # 事务提交成功后立即销毁内存中的源分片与重组秘密。
         pending.clear(body.migration_id)

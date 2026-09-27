@@ -27,6 +27,11 @@ The same gates exist for the cross-policy migration share flow under the
 ``migration.*`` prefix (``migration.after_lock`` / ``migration.after_add`` /
 ``migration.before_resplit``), pinning the identical rollback/lock interleaving
 on in-memory source-shard accumulation and target re-sharding.
+``scripts/race_migration.py`` additionally parks a threshold-reaching submit at
+``migration.before_resplit`` (row lock held, pending shares lost) while a
+second submitter queues on the lock, proving the queued request can only fail
+fast with ``MIGRATION_FAILED`` once the gap detector commits the ``failed``
+terminal state — never complete the doomed session.
 
 Header protocol (only honored when fault injection is enabled):
 

@@ -44,8 +44,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="多方密钥分片托管与门限恢复 API",
-    version="1.4.0",
-    description="不可变策略 + Shamir n-of-m 分片 + 门限恢复（提交本人分片，一次性密文）+ 跨策略密钥迁移",
+    version="1.5.0",
+    description="不可变策略 + Shamir n-of-m 分片 + 门限恢复（提交本人分片，一次性密文）+ 跨策略密钥迁移（缺片 failed 终态可安全重试）",
     lifespan=lifespan,
 )
 install_exception_handlers(app)
